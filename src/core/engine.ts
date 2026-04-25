@@ -98,7 +98,7 @@ export function clampSearchLimit(limit: number | undefined, defaultLimit = 20, c
 
 export interface BrainEngine {
   /** Discriminator: lets migrations and other consumers branch on engine kind without instanceof + dynamic imports. */
-  readonly kind: 'postgres' | 'pglite';
+  readonly kind: 'postgres' | 'pglite' | 'sqlite-lance';
 
   // Lifecycle
   connect(config: EngineConfig): Promise<void>;
