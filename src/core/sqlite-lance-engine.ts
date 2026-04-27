@@ -9,7 +9,14 @@
  * PGLite's ~300MB RSS is prohibitive.
  */
 
-import { Database } from 'bun:sqlite';
+// Runtime-adaptive SQLite import: bun:sqlite in Bun, better-sqlite3 in Node.
+let Database: any;
+const isBun = typeof globalThis.Bun !== 'undefined';
+if (isBun) {
+  Database = (await import('bun:sqlite')).Database;
+} else {
+  Database = (await import('better-sqlite3')).default;
+}
 import * as lancedb from '@lancedb/lancedb';
 import {
   Float32 as ArrowFloat32,
