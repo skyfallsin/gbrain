@@ -18,13 +18,15 @@
 -- sources: multi-brain tenancy (v0.18.0)
 -- ============================================================
 CREATE TABLE IF NOT EXISTS sources (
-  id            TEXT PRIMARY KEY,
-  name          TEXT NOT NULL UNIQUE,
-  local_path    TEXT,
-  last_commit   TEXT,
-  last_sync_at  TEXT,
-  config        TEXT NOT NULL DEFAULT '{}',
-  created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+  id              TEXT PRIMARY KEY,
+  name            TEXT NOT NULL UNIQUE,
+  local_path      TEXT,
+  last_commit     TEXT,
+  last_sync_at    TEXT,
+  config          TEXT NOT NULL DEFAULT '{}',
+  -- v0.20.0 Cathedral II: chunker version last used to sync this source.
+  chunker_version TEXT,
+  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
 INSERT OR IGNORE INTO sources (id, name, config)
@@ -39,6 +41,9 @@ CREATE TABLE IF NOT EXISTS pages (
                   REFERENCES sources(id) ON DELETE CASCADE,
   slug            TEXT    NOT NULL,
   type            TEXT    NOT NULL,
+  -- v0.19.0: distinguishes markdown vs code pages at the DB level.
+  page_kind       TEXT    NOT NULL DEFAULT 'markdown'
+                  CHECK (page_kind IN ('markdown','code')),
   title           TEXT    NOT NULL,
   compiled_truth  TEXT    NOT NULL DEFAULT '',
   timeline        TEXT    NOT NULL DEFAULT '',
@@ -88,19 +93,105 @@ END;
 -- content_chunks: chunked content (embeddings in LanceDB)
 -- ============================================================
 CREATE TABLE IF NOT EXISTS content_chunks (
-  id            INTEGER PRIMARY KEY AUTOINCREMENT,
-  page_id       INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
-  chunk_index   INTEGER NOT NULL,
-  chunk_text    TEXT    NOT NULL,
-  chunk_source  TEXT    NOT NULL DEFAULT 'compiled_truth',
-  model         TEXT    NOT NULL DEFAULT 'text-embedding-3-large',
-  token_count   INTEGER,
-  embedded_at   TEXT,
-  created_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+  page_id               INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+  chunk_index           INTEGER NOT NULL,
+  chunk_text            TEXT    NOT NULL,
+  chunk_source          TEXT    NOT NULL DEFAULT 'compiled_truth',
+  model                 TEXT    NOT NULL DEFAULT 'text-embedding-3-large',
+  token_count           INTEGER,
+  embedded_at           TEXT,
+  created_at            TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  -- v0.19.0: code chunk metadata. Nullable — markdown chunks leave these NULL.
+  language              TEXT,
+  symbol_name           TEXT,
+  symbol_type           TEXT,
+  start_line            INTEGER,
+  end_line              INTEGER,
+  -- v0.20.0 Cathedral II: qualified symbol identity + parent scope + doc-comment.
+  parent_symbol_path    TEXT,  -- JSON array, e.g. '["MyClass","innerMethod"]'
+  doc_comment           TEXT,
+  symbol_name_qualified TEXT,
   UNIQUE (page_id, chunk_index)
 );
 
 CREATE INDEX IF NOT EXISTS idx_chunks_page ON content_chunks(page_id);
+-- v0.19.0: partial indexes for code chunks.
+CREATE INDEX IF NOT EXISTS idx_chunks_symbol_name ON content_chunks(symbol_name) WHERE symbol_name IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_chunks_language ON content_chunks(language) WHERE language IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_chunks_symbol_qualified
+  ON content_chunks(symbol_name_qualified) WHERE symbol_name_qualified IS NOT NULL;
+
+-- ============================================================
+-- FTS5 virtual table for chunk-grain keyword search (v0.20.0 Cathedral II)
+-- Replaces page-grain FTS for ranking; page-grain FTS kept for resolve/suggest.
+-- ============================================================
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+  chunk_text,
+  doc_comment,
+  symbol_name_qualified,
+  content='content_chunks',
+  content_rowid='id',
+  tokenize='porter unicode61'
+);
+
+-- Triggers to keep chunks_fts in sync
+CREATE TRIGGER IF NOT EXISTS chunks_fts_insert AFTER INSERT ON content_chunks BEGIN
+  INSERT INTO chunks_fts(rowid, chunk_text, doc_comment, symbol_name_qualified)
+  VALUES (NEW.id, NEW.chunk_text, COALESCE(NEW.doc_comment, ''), COALESCE(NEW.symbol_name_qualified, ''));
+END;
+
+CREATE TRIGGER IF NOT EXISTS chunks_fts_update AFTER UPDATE ON content_chunks BEGIN
+  INSERT INTO chunks_fts(chunks_fts, rowid, chunk_text, doc_comment, symbol_name_qualified)
+  VALUES ('delete', OLD.id, OLD.chunk_text, COALESCE(OLD.doc_comment, ''), COALESCE(OLD.symbol_name_qualified, ''));
+  INSERT INTO chunks_fts(rowid, chunk_text, doc_comment, symbol_name_qualified)
+  VALUES (NEW.id, NEW.chunk_text, COALESCE(NEW.doc_comment, ''), COALESCE(NEW.symbol_name_qualified, ''));
+END;
+
+CREATE TRIGGER IF NOT EXISTS chunks_fts_delete AFTER DELETE ON content_chunks BEGIN
+  INSERT INTO chunks_fts(chunks_fts, rowid, chunk_text, doc_comment, symbol_name_qualified)
+  VALUES ('delete', OLD.id, OLD.chunk_text, COALESCE(OLD.doc_comment, ''), COALESCE(OLD.symbol_name_qualified, ''));
+END;
+
+-- ============================================================
+-- code_edges_chunk + code_edges_symbol: v0.20.0 Cathedral II structural edges
+-- ============================================================
+CREATE TABLE IF NOT EXISTS code_edges_chunk (
+  id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+  from_chunk_id         INTEGER NOT NULL REFERENCES content_chunks(id) ON DELETE CASCADE,
+  to_chunk_id           INTEGER NOT NULL REFERENCES content_chunks(id) ON DELETE CASCADE,
+  from_symbol_qualified TEXT NOT NULL,
+  to_symbol_qualified   TEXT NOT NULL,
+  edge_type             TEXT NOT NULL,
+  edge_metadata         TEXT NOT NULL DEFAULT '{}',
+  source_id             TEXT REFERENCES sources(id) ON DELETE CASCADE,
+  created_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  UNIQUE (from_chunk_id, to_chunk_id, edge_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_code_edges_chunk_from
+  ON code_edges_chunk(from_chunk_id, edge_type);
+CREATE INDEX IF NOT EXISTS idx_code_edges_chunk_to
+  ON code_edges_chunk(to_chunk_id, edge_type);
+CREATE INDEX IF NOT EXISTS idx_code_edges_chunk_to_symbol
+  ON code_edges_chunk(to_symbol_qualified, edge_type);
+
+CREATE TABLE IF NOT EXISTS code_edges_symbol (
+  id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+  from_chunk_id         INTEGER NOT NULL REFERENCES content_chunks(id) ON DELETE CASCADE,
+  from_symbol_qualified TEXT NOT NULL,
+  to_symbol_qualified   TEXT NOT NULL,
+  edge_type             TEXT NOT NULL,
+  edge_metadata         TEXT NOT NULL DEFAULT '{}',
+  source_id             TEXT REFERENCES sources(id) ON DELETE CASCADE,
+  created_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  UNIQUE (from_chunk_id, to_symbol_qualified, edge_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_code_edges_symbol_from
+  ON code_edges_symbol(from_chunk_id, edge_type);
+CREATE INDEX IF NOT EXISTS idx_code_edges_symbol_to
+  ON code_edges_symbol(to_symbol_qualified, edge_type);
 
 -- ============================================================
 -- links: cross-references between pages

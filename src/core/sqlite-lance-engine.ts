@@ -32,7 +32,7 @@ import type {
 import { MAX_SEARCH_LIMIT, clampSearchLimit } from './engine.ts';
 import type {
   Page, PageInput, PageFilters, PageType,
-  Chunk, ChunkInput,
+  Chunk, ChunkInput, StaleChunkRow,
   SearchResult, SearchOpts,
   Link, GraphNode, GraphPath,
   TimelineEntry, TimelineInput, TimelineOpts,
@@ -41,6 +41,7 @@ import type {
   BrainStats, BrainHealth,
   IngestLogEntry, IngestLogInput,
   EngineConfig,
+  CodeEdgeInput, CodeEdgeResult,
 } from './types.ts';
 import { validateSlug, contentHash } from './utils.ts';
 
@@ -163,12 +164,14 @@ export class SQLiteLanceEngine implements BrainEngine {
     const hash = page.content_hash || contentHash(page);
     const frontmatter = page.frontmatter || {};
     const now = new Date().toISOString();
+    const pageKind = page.page_kind || 'markdown';
 
     const row = this.db.prepare(
-      `INSERT INTO pages (slug, type, title, compiled_truth, timeline, frontmatter, content_hash, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO pages (slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (source_id, slug) DO UPDATE SET
          type = excluded.type,
+         page_kind = excluded.page_kind,
          title = excluded.title,
          compiled_truth = excluded.compiled_truth,
          timeline = excluded.timeline,
@@ -177,7 +180,7 @@ export class SQLiteLanceEngine implements BrainEngine {
          updated_at = ?
        RETURNING id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at`
     ).get(
-      slug, page.type, page.title, page.compiled_truth, page.timeline || '',
+      slug, page.type, pageKind, page.title, page.compiled_truth, page.timeline || '',
       JSON.stringify(frontmatter), hash, now, now
     ) as Record<string, unknown>;
     return this._rowToPage(row);
@@ -235,17 +238,72 @@ export class SQLiteLanceEngine implements BrainEngine {
     if (opts?.limit && opts.limit > MAX_SEARCH_LIMIT)
       console.warn(`[gbrain] Warning: search limit clamped from ${opts.limit} to ${MAX_SEARCH_LIMIT}`);
 
-    return (this.db.prepare(
+    // v0.20.0: chunk-grain FTS via chunks_fts, deduped to best-chunk-per-page.
+    const innerLimit = Math.min(limit * 3, MAX_SEARCH_LIMIT * 3);
+    let extraFilter = '';
+    const params: unknown[] = [query, innerLimit];
+    if (opts?.language) {
+      params.push(opts.language);
+      extraFilter += ` AND cc.language = ?`;
+    }
+    if (opts?.symbolKind) {
+      params.push(opts.symbolKind);
+      extraFilter += ` AND cc.symbol_type = ?`;
+    }
+
+    // Inner query: rank at chunk grain. Outer: dedup to best per page.
+    const rows = this.db.prepare(
+      `SELECT * FROM (
+         SELECT p.slug, p.id as page_id, p.title, p.type, p.source_id,
+           cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
+           chunks_fts.rank as score,
+           CASE WHEN p.updated_at < (SELECT MAX(te.created_at) FROM timeline_entries te WHERE te.page_id = p.id) THEN 1 ELSE 0 END AS stale,
+           ROW_NUMBER() OVER (PARTITION BY p.slug ORDER BY chunks_fts.rank) as rn
+         FROM chunks_fts
+         JOIN content_chunks cc ON cc.id = chunks_fts.rowid
+         JOIN pages p ON p.id = cc.page_id
+         WHERE chunks_fts MATCH ? ${detailFilter}${extraFilter}
+         ORDER BY chunks_fts.rank
+         LIMIT ?
+       ) WHERE rn = 1
+       ORDER BY score
+       LIMIT ? OFFSET ?`
+    ).all(...params, limit, offset) as Record<string, unknown>[];
+
+    return rows.map(r => this._rowToSearchResult(r));
+  }
+
+  async searchKeywordChunks(query: string, opts?: SearchOpts): Promise<SearchResult[]> {
+    const limit = clampSearchLimit(opts?.limit);
+    const offset = opts?.offset || 0;
+    const detailFilter = opts?.detail === 'low' ? `AND cc.chunk_source = 'compiled_truth'` : '';
+    if (opts?.limit && opts.limit > MAX_SEARCH_LIMIT)
+      console.warn(`[gbrain] Warning: search limit clamped from ${opts.limit} to ${MAX_SEARCH_LIMIT}`);
+
+    let extraFilter = '';
+    const params: unknown[] = [query];
+    if (opts?.language) {
+      params.push(opts.language);
+      extraFilter += ` AND cc.language = ?`;
+    }
+    if (opts?.symbolKind) {
+      params.push(opts.symbolKind);
+      extraFilter += ` AND cc.symbol_type = ?`;
+    }
+
+    const rows = this.db.prepare(
       `SELECT p.slug, p.id as page_id, p.title, p.type, p.source_id,
         cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
-        rank as score,
+        chunks_fts.rank as score,
         CASE WHEN p.updated_at < (SELECT MAX(te.created_at) FROM timeline_entries te WHERE te.page_id = p.id) THEN 1 ELSE 0 END AS stale
-      FROM pages_fts
-      JOIN pages p ON p.id = pages_fts.rowid
-      JOIN content_chunks cc ON cc.page_id = p.id
-      WHERE pages_fts MATCH ? ${detailFilter}
-      ORDER BY rank LIMIT ? OFFSET ?`
-    ).all(query, limit, offset) as Record<string, unknown>[]).map(r => this._rowToSearchResult(r));
+      FROM chunks_fts
+      JOIN content_chunks cc ON cc.id = chunks_fts.rowid
+      JOIN pages p ON p.id = cc.page_id
+      WHERE chunks_fts MATCH ? ${detailFilter}${extraFilter}
+      ORDER BY chunks_fts.rank LIMIT ? OFFSET ?`
+    ).all(...params, limit, offset) as Record<string, unknown>[];
+
+    return rows.map(r => this._rowToSearchResult(r));
   }
 
   async searchVector(embedding: Float32Array, opts?: SearchOpts): Promise<SearchResult[]> {
@@ -323,14 +381,22 @@ export class SQLiteLanceEngine implements BrainEngine {
     }
 
     const upsertStmt = this.db.prepare(
-      `INSERT INTO content_chunks (page_id, chunk_index, chunk_text, chunk_source, model, token_count, embedded_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO content_chunks (page_id, chunk_index, chunk_text, chunk_source, model, token_count, embedded_at, language, symbol_name, symbol_type, start_line, end_line, parent_symbol_path, doc_comment, symbol_name_qualified)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (page_id, chunk_index) DO UPDATE SET
          chunk_text = CASE WHEN excluded.chunk_text != content_chunks.chunk_text THEN excluded.chunk_text ELSE content_chunks.chunk_text END,
          chunk_source = excluded.chunk_source,
          model = COALESCE(excluded.model, content_chunks.model),
          token_count = excluded.token_count,
-         embedded_at = COALESCE(excluded.embedded_at, content_chunks.embedded_at)
+         embedded_at = COALESCE(excluded.embedded_at, content_chunks.embedded_at),
+         language = excluded.language,
+         symbol_name = excluded.symbol_name,
+         symbol_type = excluded.symbol_type,
+         start_line = excluded.start_line,
+         end_line = excluded.end_line,
+         parent_symbol_path = excluded.parent_symbol_path,
+         doc_comment = excluded.doc_comment,
+         symbol_name_qualified = excluded.symbol_name_qualified
        RETURNING id`
     );
 
@@ -338,9 +404,15 @@ export class SQLiteLanceEngine implements BrainEngine {
 
     for (const chunk of chunks) {
       const now = chunk.embedding ? new Date().toISOString() : null;
+      const parentPath = chunk.parent_symbol_path && chunk.parent_symbol_path.length > 0
+        ? JSON.stringify(chunk.parent_symbol_path)
+        : null;
       const result = upsertStmt.get(
         pageId, chunk.chunk_index, chunk.chunk_text, chunk.chunk_source,
-        chunk.model || 'text-embedding-3-large', chunk.token_count || null, now
+        chunk.model || 'text-embedding-3-large', chunk.token_count || null, now,
+        chunk.language || null, chunk.symbol_name || null, chunk.symbol_type || null,
+        chunk.start_line ?? null, chunk.end_line ?? null,
+        parentPath, chunk.doc_comment || null, chunk.symbol_name_qualified || null,
       ) as { id: number };
 
       if (chunk.embedding) {
@@ -374,6 +446,177 @@ export class SQLiteLanceEngine implements BrainEngine {
       this.db.prepare('DELETE FROM content_chunks WHERE page_id = ?').run(p.id);
       try { const t = await this._ensureLanceTable(); await t.delete(`page_id = ${p.id}`); } catch {}
     }
+  }
+
+  async countStaleChunks(): Promise<number> {
+    const row = this.db.prepare(
+      `SELECT count(*) as count FROM content_chunks WHERE embedded_at IS NULL`
+    ).get() as { count: number };
+    return Number(row.count);
+  }
+
+  async listStaleChunks(): Promise<StaleChunkRow[]> {
+    return this.db.prepare(
+      `SELECT p.slug, cc.chunk_index, cc.chunk_text, cc.chunk_source,
+              cc.model, cc.token_count
+         FROM content_chunks cc
+         JOIN pages p ON p.id = cc.page_id
+        WHERE cc.embedded_at IS NULL
+        ORDER BY p.id, cc.chunk_index
+        LIMIT 100000`
+    ).all() as StaleChunkRow[];
+  }
+
+  // ── Code Edges (v0.20.0 Cathedral II) ──────────────────────
+
+  async addCodeEdges(edges: CodeEdgeInput[]): Promise<number> {
+    if (edges.length === 0) return 0;
+    let inserted = 0;
+    const resolved = edges.filter(e => e.to_chunk_id != null);
+    const unresolved = edges.filter(e => e.to_chunk_id == null);
+
+    if (resolved.length > 0) {
+      const stmt = this.db.prepare(
+        `INSERT OR IGNORE INTO code_edges_chunk
+           (from_chunk_id, to_chunk_id, from_symbol_qualified, to_symbol_qualified, edge_type, edge_metadata, source_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      );
+      const run = this.db.transaction((batch: CodeEdgeInput[]) => {
+        let c = 0;
+        for (const e of batch) {
+          const r = stmt.run(
+            e.from_chunk_id, e.to_chunk_id, e.from_symbol_qualified,
+            e.to_symbol_qualified, e.edge_type,
+            JSON.stringify(e.edge_metadata ?? {}),
+            e.source_id ?? null,
+          );
+          c += r.changes;
+        }
+        return c;
+      });
+      inserted += run(resolved);
+    }
+
+    if (unresolved.length > 0) {
+      const stmt = this.db.prepare(
+        `INSERT OR IGNORE INTO code_edges_symbol
+           (from_chunk_id, from_symbol_qualified, to_symbol_qualified, edge_type, edge_metadata, source_id)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      );
+      const run = this.db.transaction((batch: CodeEdgeInput[]) => {
+        let c = 0;
+        for (const e of batch) {
+          const r = stmt.run(
+            e.from_chunk_id, e.from_symbol_qualified, e.to_symbol_qualified, e.edge_type,
+            JSON.stringify(e.edge_metadata ?? {}),
+            e.source_id ?? null,
+          );
+          c += r.changes;
+        }
+        return c;
+      });
+      inserted += run(unresolved);
+    }
+    return inserted;
+  }
+
+  async deleteCodeEdgesForChunks(chunkIds: number[]): Promise<void> {
+    if (chunkIds.length === 0) return;
+    const ph = chunkIds.map(() => '?').join(',');
+    this.db.prepare(
+      `DELETE FROM code_edges_chunk WHERE from_chunk_id IN (${ph}) OR to_chunk_id IN (${ph})`
+    ).run(...chunkIds, ...chunkIds);
+    this.db.prepare(
+      `DELETE FROM code_edges_symbol WHERE from_chunk_id IN (${ph})`
+    ).run(...chunkIds);
+  }
+
+  async getCallersOf(
+    qualifiedName: string,
+    opts?: { sourceId?: string; allSources?: boolean; limit?: number },
+  ): Promise<CodeEdgeResult[]> {
+    const limit = Math.min(opts?.limit ?? 100, 500);
+    const sourceClause = opts?.allSources || !opts?.sourceId ? '' : `AND source_id = ?`;
+    const params: unknown[] = sourceClause ? [qualifiedName, opts!.sourceId, qualifiedName, opts!.sourceId, limit] : [qualifiedName, qualifiedName, limit];
+
+    const rows = this.db.prepare(
+      `SELECT id, from_chunk_id, to_chunk_id, from_symbol_qualified, to_symbol_qualified,
+              edge_type, edge_metadata, source_id, 1 as resolved
+         FROM code_edges_chunk
+         WHERE to_symbol_qualified = ? ${sourceClause}
+       UNION ALL
+       SELECT id, from_chunk_id, NULL as to_chunk_id, from_symbol_qualified, to_symbol_qualified,
+              edge_type, edge_metadata, source_id, 0 as resolved
+         FROM code_edges_symbol
+         WHERE to_symbol_qualified = ? ${sourceClause}
+       LIMIT ?`
+    ).all(...params) as Record<string, unknown>[];
+    return rows.map(rowToCodeEdge);
+  }
+
+  async getCalleesOf(
+    qualifiedName: string,
+    opts?: { sourceId?: string; allSources?: boolean; limit?: number },
+  ): Promise<CodeEdgeResult[]> {
+    const limit = Math.min(opts?.limit ?? 100, 500);
+    const sourceClause = opts?.allSources || !opts?.sourceId ? '' : `AND source_id = ?`;
+    const params: unknown[] = sourceClause ? [qualifiedName, opts!.sourceId, qualifiedName, opts!.sourceId, limit] : [qualifiedName, qualifiedName, limit];
+
+    const rows = this.db.prepare(
+      `SELECT id, from_chunk_id, to_chunk_id, from_symbol_qualified, to_symbol_qualified,
+              edge_type, edge_metadata, source_id, 1 as resolved
+         FROM code_edges_chunk
+         WHERE from_symbol_qualified = ? ${sourceClause}
+       UNION ALL
+       SELECT id, from_chunk_id, NULL as to_chunk_id, from_symbol_qualified, to_symbol_qualified,
+              edge_type, edge_metadata, source_id, 0 as resolved
+         FROM code_edges_symbol
+         WHERE from_symbol_qualified = ? ${sourceClause}
+       LIMIT ?`
+    ).all(...params) as Record<string, unknown>[];
+    return rows.map(rowToCodeEdge);
+  }
+
+  async getEdgesByChunk(
+    chunkId: number,
+    opts?: { direction?: 'in' | 'out' | 'both'; edgeType?: string; limit?: number },
+  ): Promise<CodeEdgeResult[]> {
+    const direction = opts?.direction ?? 'both';
+    const limit = Math.min(opts?.limit ?? 50, 200);
+    const edgeTypeClause = opts?.edgeType ? `AND edge_type = '${opts.edgeType.replace(/'/g, "''")}'` : '';
+
+    let chunkFilter = '';
+    if (direction === 'in') chunkFilter = `WHERE to_chunk_id = ?`;
+    else if (direction === 'out') chunkFilter = `WHERE from_chunk_id = ?`;
+    else chunkFilter = `WHERE (from_chunk_id = ? OR to_chunk_id = ?)`;
+
+    let symbolFilter = '';
+    if (direction === 'out' || direction === 'both') {
+      symbolFilter = `WHERE from_chunk_id = ?`;
+    }
+
+    const unionClause = symbolFilter ? `
+      UNION ALL
+      SELECT id, from_chunk_id, NULL as to_chunk_id, from_symbol_qualified, to_symbol_qualified,
+             edge_type, edge_metadata, source_id, 0 as resolved
+        FROM code_edges_symbol
+        ${symbolFilter} ${edgeTypeClause}
+    ` : '';
+
+    const params: unknown[] = [];
+    if (direction === 'both') { params.push(chunkId, chunkId); } else { params.push(chunkId); }
+    if (symbolFilter) params.push(chunkId);
+    params.push(limit);
+
+    const rows = this.db.prepare(
+      `SELECT id, from_chunk_id, to_chunk_id, from_symbol_qualified, to_symbol_qualified,
+              edge_type, edge_metadata, source_id, 1 as resolved
+         FROM code_edges_chunk
+         ${chunkFilter} ${edgeTypeClause}
+       ${unionClause}
+       LIMIT ?`
+    ).all(...params) as Record<string, unknown>[];
+    return rows.map(rowToCodeEdge);
   }
 
   // ── Links ──────────────────────────────────────────────────
@@ -803,10 +1046,18 @@ export class SQLiteLanceEngine implements BrainEngine {
     return {
       id: row.id as number, page_id: row.page_id as number,
       chunk_index: row.chunk_index as number, chunk_text: row.chunk_text as string,
-      chunk_source: row.chunk_source as 'compiled_truth' | 'timeline',
+      chunk_source: row.chunk_source as 'compiled_truth' | 'timeline' | 'fenced_code',
       embedding: null, model: row.model as string,
       token_count: row.token_count as number | null,
       embedded_at: row.embedded_at ? new Date(row.embedded_at as string) : null,
+      language: row.language as string | null ?? null,
+      symbol_name: row.symbol_name as string | null ?? null,
+      symbol_type: row.symbol_type as string | null ?? null,
+      start_line: row.start_line as number | null ?? null,
+      end_line: row.end_line as number | null ?? null,
+      parent_symbol_path: row.parent_symbol_path ? JSON.parse(row.parent_symbol_path as string) : null,
+      doc_comment: row.doc_comment as string | null ?? null,
+      symbol_name_qualified: row.symbol_name_qualified as string | null ?? null,
     };
   }
 
@@ -814,7 +1065,7 @@ export class SQLiteLanceEngine implements BrainEngine {
     const r: SearchResult = {
       slug: row.slug as string, page_id: row.page_id as number,
       title: row.title as string, type: row.type as PageType,
-      chunk_text: row.chunk_text as string, chunk_source: row.chunk_source as 'compiled_truth' | 'timeline',
+      chunk_text: row.chunk_text as string, chunk_source: row.chunk_source as 'compiled_truth' | 'timeline' | 'fenced_code',
       chunk_id: row.chunk_id as number, chunk_index: row.chunk_index as number,
       score: Number(row.score), stale: Boolean(row.stale),
     };
@@ -830,4 +1081,18 @@ export class SQLiteLanceEngine implements BrainEngine {
       snapshot_at: new Date(row.snapshot_at as string),
     };
   }
+}
+
+function rowToCodeEdge(row: Record<string, unknown>): CodeEdgeResult {
+  return {
+    id: row.id as number,
+    from_chunk_id: row.from_chunk_id as number,
+    to_chunk_id: row.to_chunk_id == null ? null : (row.to_chunk_id as number),
+    from_symbol_qualified: (row.from_symbol_qualified as string) ?? '',
+    to_symbol_qualified: (row.to_symbol_qualified as string) ?? '',
+    edge_type: (row.edge_type as string) ?? '',
+    edge_metadata: typeof row.edge_metadata === 'string' ? JSON.parse(row.edge_metadata) : (row.edge_metadata as Record<string, unknown>) ?? {},
+    source_id: row.source_id == null ? null : (row.source_id as string),
+    resolved: Boolean(row.resolved),
+  };
 }

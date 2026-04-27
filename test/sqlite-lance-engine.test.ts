@@ -249,7 +249,8 @@ describe('SQLiteLanceEngine: FTS5 Keyword Search', () => {
   });
 
   test('FTS5 triggers populate on insert', async () => {
-    const results = await engine.searchKeyword('enterprise automation');
+    // chunk_text contains 'enterprise' — chunk-grain FTS via chunks_fts
+    const results = await engine.searchKeyword('enterprise');
     expect(results.length).toBeGreaterThan(0);
   });
 
@@ -1538,5 +1539,321 @@ describe('SQLiteLanceEngine: Edge cases', () => {
     const promises = Array.from({ length: 10 }, () => engine.getPage('test/concurrent'));
     const results = await Promise.all(promises);
     expect(results.every(r => r !== null)).toBe(true);
+  });
+});
+
+// ============================================================
+// v0.20.0+ new methods: countStaleChunks, listStaleChunks,
+// searchKeywordChunks, code edges
+// ============================================================
+
+describe('SQLiteLanceEngine: countStaleChunks & listStaleChunks', () => {
+  beforeAll(async () => {
+    truncateAll();
+    await engine.putPage('stale/test-page', {
+      type: 'note', title: 'Stale Test',
+      compiled_truth: 'Content for stale chunk testing.',
+    });
+    // Chunks without embeddings are "stale"
+    await engine.upsertChunks('stale/test-page', [
+      { chunk_index: 0, chunk_text: 'chunk zero no embedding', chunk_source: 'compiled_truth' },
+      { chunk_index: 1, chunk_text: 'chunk one with embedding', chunk_source: 'compiled_truth',
+        embedding: new Float32Array(768).fill(0.1), model: 'test-model', token_count: 5 },
+      { chunk_index: 2, chunk_text: 'chunk two no embedding', chunk_source: 'compiled_truth' },
+    ]);
+  });
+
+  test('countStaleChunks returns count of chunks with no embedding', async () => {
+    const count = await engine.countStaleChunks();
+    expect(count).toBe(2); // chunks 0 and 2
+  });
+
+  test('listStaleChunks returns stale chunk rows', async () => {
+    const stale = await engine.listStaleChunks();
+    expect(stale.length).toBe(2);
+    expect(stale[0].slug).toBe('stale/test-page');
+    expect(stale[0].chunk_index).toBe(0);
+    expect(stale[1].chunk_index).toBe(2);
+  });
+
+  test('countStaleChunks returns 0 when all embedded', async () => {
+    truncateAll();
+    await engine.putPage('stale/all-embedded', {
+      type: 'note', title: 'All Embedded',
+      compiled_truth: 'All chunks have embeddings.',
+    });
+    await engine.upsertChunks('stale/all-embedded', [
+      { chunk_index: 0, chunk_text: 'embedded chunk', chunk_source: 'compiled_truth',
+        embedding: new Float32Array(768).fill(0.2), model: 'test', token_count: 3 },
+    ]);
+    expect(await engine.countStaleChunks()).toBe(0);
+  });
+});
+
+describe('SQLiteLanceEngine: searchKeywordChunks', () => {
+  beforeAll(async () => {
+    truncateAll();
+    await engine.putPage('search/page-a', {
+      type: 'note', title: 'Page A',
+      compiled_truth: 'Alpha content.',
+    });
+    await engine.upsertChunks('search/page-a', [
+      { chunk_index: 0, chunk_text: 'alpha bravo charlie', chunk_source: 'compiled_truth' },
+      { chunk_index: 1, chunk_text: 'alpha delta echo', chunk_source: 'compiled_truth' },
+    ]);
+    await engine.putPage('search/page-b', {
+      type: 'note', title: 'Page B',
+      compiled_truth: 'Bravo content.',
+    });
+    await engine.upsertChunks('search/page-b', [
+      { chunk_index: 0, chunk_text: 'alpha foxtrot golf', chunk_source: 'compiled_truth' },
+    ]);
+  });
+
+  test('returns all matching chunks (no page dedup)', async () => {
+    const results = await engine.searchKeywordChunks('alpha');
+    // 3 chunks contain 'alpha' across 2 pages
+    expect(results.length).toBe(3);
+  });
+
+  test('searchKeyword deduplicates to one per page', async () => {
+    const results = await engine.searchKeyword('alpha');
+    // 2 pages contain 'alpha'
+    expect(results.length).toBe(2);
+    const slugs = results.map(r => r.slug);
+    expect(new Set(slugs).size).toBe(2);
+  });
+
+  test('respects limit', async () => {
+    const results = await engine.searchKeywordChunks('alpha', { limit: 1 });
+    expect(results.length).toBe(1);
+  });
+
+  test('returns empty for non-matching term', async () => {
+    const results = await engine.searchKeywordChunks('zzznotfound');
+    expect(results.length).toBe(0);
+  });
+});
+
+describe('SQLiteLanceEngine: Code chunk metadata', () => {
+  beforeAll(async () => {
+    truncateAll();
+    await engine.putPage('code/myfile.ts', {
+      type: 'code', title: 'myfile.ts',
+      compiled_truth: 'function greet() { return "hello"; }',
+      page_kind: 'code',
+    });
+    await engine.upsertChunks('code/myfile.ts', [
+      {
+        chunk_index: 0, chunk_text: 'function greet() { return "hello"; }',
+        chunk_source: 'fenced_code',
+        language: 'typescript', symbol_name: 'greet', symbol_type: 'function',
+        start_line: 1, end_line: 1,
+        parent_symbol_path: ['module'],
+        doc_comment: 'Greets the user',
+        symbol_name_qualified: 'myfile.greet',
+      },
+    ]);
+  });
+
+  test('getChunks returns code metadata', async () => {
+    const chunks = await engine.getChunks('code/myfile.ts');
+    expect(chunks.length).toBe(1);
+    expect(chunks[0].language).toBe('typescript');
+    expect(chunks[0].symbol_name).toBe('greet');
+    expect(chunks[0].symbol_type).toBe('function');
+    expect(chunks[0].start_line).toBe(1);
+    expect(chunks[0].end_line).toBe(1);
+    expect(chunks[0].parent_symbol_path).toEqual(['module']);
+    expect(chunks[0].doc_comment).toBe('Greets the user');
+    expect(chunks[0].symbol_name_qualified).toBe('myfile.greet');
+    expect(chunks[0].chunk_source).toBe('fenced_code');
+  });
+
+  test('markdown chunks have null code metadata', async () => {
+    await engine.putPage('plain/note', {
+      type: 'note', title: 'Note',
+      compiled_truth: 'Just text.',
+    });
+    await engine.upsertChunks('plain/note', [
+      { chunk_index: 0, chunk_text: 'Just plain text.', chunk_source: 'compiled_truth' },
+    ]);
+    const chunks = await engine.getChunks('plain/note');
+    expect(chunks[0].language).toBeNull();
+    expect(chunks[0].symbol_name).toBeNull();
+    expect(chunks[0].parent_symbol_path).toBeNull();
+  });
+
+  test('searchKeywordChunks with language filter', async () => {
+    const ts = await engine.searchKeywordChunks('greet', { language: 'typescript' });
+    expect(ts.length).toBe(1);
+    const py = await engine.searchKeywordChunks('greet', { language: 'python' });
+    expect(py.length).toBe(0);
+  });
+});
+
+describe('SQLiteLanceEngine: Code Edges', () => {
+  let chunkA: number;
+  let chunkB: number;
+  let chunkC: number;
+
+  beforeAll(async () => {
+    truncateAll();
+    await engine.putPage('code/a.ts', {
+      type: 'code', title: 'a.ts', compiled_truth: 'function fnA() {}', page_kind: 'code',
+    });
+    await engine.upsertChunks('code/a.ts', [
+      { chunk_index: 0, chunk_text: 'function fnA() { fnB(); }', chunk_source: 'fenced_code',
+        symbol_name_qualified: 'a.fnA', language: 'typescript', symbol_name: 'fnA', symbol_type: 'function' },
+    ]);
+    await engine.putPage('code/b.ts', {
+      type: 'code', title: 'b.ts', compiled_truth: 'function fnB() {}', page_kind: 'code',
+    });
+    await engine.upsertChunks('code/b.ts', [
+      { chunk_index: 0, chunk_text: 'function fnB() { fnC(); }', chunk_source: 'fenced_code',
+        symbol_name_qualified: 'b.fnB', language: 'typescript', symbol_name: 'fnB', symbol_type: 'function' },
+    ]);
+    await engine.putPage('code/c.ts', {
+      type: 'code', title: 'c.ts', compiled_truth: 'function fnC() {}', page_kind: 'code',
+    });
+    await engine.upsertChunks('code/c.ts', [
+      { chunk_index: 0, chunk_text: 'function fnC() { }', chunk_source: 'fenced_code',
+        symbol_name_qualified: 'c.fnC', language: 'typescript', symbol_name: 'fnC', symbol_type: 'function' },
+    ]);
+
+    // Get chunk IDs
+    const chunksA = await engine.getChunks('code/a.ts');
+    const chunksB = await engine.getChunks('code/b.ts');
+    const chunksC = await engine.getChunks('code/c.ts');
+    chunkA = chunksA[0].id;
+    chunkB = chunksB[0].id;
+    chunkC = chunksC[0].id;
+  });
+
+  test('addCodeEdges inserts resolved edges', async () => {
+    const count = await engine.addCodeEdges([
+      { from_chunk_id: chunkA, to_chunk_id: chunkB, from_symbol_qualified: 'a.fnA',
+        to_symbol_qualified: 'b.fnB', edge_type: 'calls' },
+      { from_chunk_id: chunkB, to_chunk_id: chunkC, from_symbol_qualified: 'b.fnB',
+        to_symbol_qualified: 'c.fnC', edge_type: 'calls' },
+    ]);
+    expect(count).toBe(2);
+  });
+
+  test('addCodeEdges inserts unresolved edges', async () => {
+    const count = await engine.addCodeEdges([
+      { from_chunk_id: chunkA, from_symbol_qualified: 'a.fnA',
+        to_symbol_qualified: 'external.util', edge_type: 'imports' },
+    ]);
+    expect(count).toBe(1);
+  });
+
+  test('addCodeEdges is idempotent (ON CONFLICT DO NOTHING)', async () => {
+    const count = await engine.addCodeEdges([
+      { from_chunk_id: chunkA, to_chunk_id: chunkB, from_symbol_qualified: 'a.fnA',
+        to_symbol_qualified: 'b.fnB', edge_type: 'calls' },
+    ]);
+    expect(count).toBe(0);
+  });
+
+  test('getCallersOf returns edges pointing to a symbol', async () => {
+    const callers = await engine.getCallersOf('b.fnB');
+    expect(callers.length).toBe(1);
+    expect(callers[0].from_chunk_id).toBe(chunkA);
+    expect(callers[0].edge_type).toBe('calls');
+    expect(callers[0].resolved).toBe(true);
+  });
+
+  test('getCalleesOf returns edges from a symbol', async () => {
+    const callees = await engine.getCalleesOf('a.fnA');
+    // resolved: a.fnA -> b.fnB, unresolved: a.fnA -> external.util
+    expect(callees.length).toBe(2);
+    const types = callees.map(e => e.edge_type).sort();
+    expect(types).toEqual(['calls', 'imports']);
+  });
+
+  test('getEdgesByChunk direction=out', async () => {
+    const edges = await engine.getEdgesByChunk(chunkA, { direction: 'out' });
+    // resolved: a->b, unresolved: a->external.util
+    expect(edges.length).toBe(2);
+    expect(edges.every(e => e.from_chunk_id === chunkA)).toBe(true);
+  });
+
+  test('getEdgesByChunk direction=in', async () => {
+    const edges = await engine.getEdgesByChunk(chunkB, { direction: 'in' });
+    expect(edges.length).toBe(1);
+    expect(edges[0].from_chunk_id).toBe(chunkA);
+    expect(edges[0].to_chunk_id).toBe(chunkB);
+  });
+
+  test('getEdgesByChunk direction=both', async () => {
+    const edges = await engine.getEdgesByChunk(chunkB, { direction: 'both' });
+    // in: a->b, out: b->c, unresolved out: none (b has no unresolved)
+    expect(edges.length).toBe(2);
+  });
+
+  test('getEdgesByChunk with edgeType filter', async () => {
+    const edges = await engine.getEdgesByChunk(chunkA, { direction: 'out', edgeType: 'imports' });
+    expect(edges.length).toBe(1);
+    expect(edges[0].to_symbol_qualified).toBe('external.util');
+  });
+
+  test('deleteCodeEdgesForChunks removes edges in both directions', async () => {
+    // Delete edges for chunkA
+    await engine.deleteCodeEdgesForChunks([chunkA]);
+    // a->b gone (resolved), a->external.util gone (unresolved)
+    const callersB = await engine.getCallersOf('b.fnB');
+    expect(callersB.length).toBe(0);
+    const calleesA = await engine.getCalleesOf('a.fnA');
+    expect(calleesA.length).toBe(0);
+    // b->c should still exist
+    const calleesB = await engine.getCalleesOf('b.fnB');
+    expect(calleesB.length).toBe(1);
+    expect(calleesB[0].to_symbol_qualified).toBe('c.fnC');
+  });
+
+  test('deleteCodeEdgesForChunks with empty array is no-op', async () => {
+    await engine.deleteCodeEdgesForChunks([]);
+    // Should not throw
+  });
+
+  test('code edge metadata round-trips as JSON', async () => {
+    await engine.addCodeEdges([
+      { from_chunk_id: chunkA, to_chunk_id: chunkB, from_symbol_qualified: 'a.fnA',
+        to_symbol_qualified: 'b.fnB', edge_type: 'calls',
+        edge_metadata: { line: 5, confidence: 0.9 } },
+    ]);
+    const edges = await engine.getCallersOf('b.fnB');
+    expect(edges.length).toBe(1);
+    expect(edges[0].edge_metadata).toEqual({ line: 5, confidence: 0.9 });
+  });
+});
+
+describe('SQLiteLanceEngine: page_kind support', () => {
+  beforeAll(async () => {
+    truncateAll();
+  });
+
+  test('putPage with page_kind=code stores correctly', async () => {
+    const page = await engine.putPage('code/test.ts', {
+      type: 'code', title: 'test.ts',
+      compiled_truth: 'const x = 1;',
+      page_kind: 'code',
+    });
+    expect(page.type).toBe('code');
+    // page_kind is stored but not in the Page return type currently
+    const raw = await engine.executeRaw<{ page_kind: string }>(
+      'SELECT page_kind FROM pages WHERE slug = ?', ['code/test.ts']);
+    expect(raw[0].page_kind).toBe('code');
+  });
+
+  test('putPage defaults page_kind to markdown', async () => {
+    await engine.putPage('notes/default', {
+      type: 'note', title: 'Default Kind',
+      compiled_truth: 'No explicit page_kind.',
+    });
+    const raw = await engine.executeRaw<{ page_kind: string }>(
+      'SELECT page_kind FROM pages WHERE slug = ?', ['notes/default']);
+    expect(raw[0].page_kind).toBe('markdown');
   });
 });
