@@ -24,7 +24,10 @@
     "./backoff": "./src/core/backoff.ts",
     "./search/hybrid": "./src/core/search/hybrid.ts",
     "./search/expansion": "./src/core/search/expansion.ts",
-    "./extract": "./src/commands/extract.ts"
+    "./sqlite-lance-engine": "./src/core/sqlite-lance-engine.ts",
+    "./extract": "./src/commands/extract.ts",
+    "./enrichment-service": "./src/core/enrichment-service.ts",
+    "./fail-improve": "./src/core/fail-improve.ts"
   },
   "scripts": {
     "dev": "bun run src/cli.ts",
