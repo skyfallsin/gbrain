@@ -277,6 +277,39 @@ export class SQLiteLanceEngine implements BrainEngine {
        LIMIT ? OFFSET ?`
     ).all(...params, limit, offset) as Record<string, unknown>[];
 
+    // Fallback: also search pages_fts (title + compiled_truth) for terms
+    // that appear in page titles but not in chunk text.
+    const seenSlugs = new Set(rows.map(r => r.slug as string));
+    const remaining = limit - rows.length;
+    if (remaining > 0) {
+      try {
+        let typeFilter = '';
+        const pageParams: unknown[] = [query, remaining, offset];
+        if (opts?.type) {
+          typeFilter = ' AND p.type = ?';
+          pageParams.splice(1, 0, opts.type);
+        }
+        const pageRows = this.db.prepare(
+          `SELECT p.slug, p.id as page_id, p.title, p.type, p.source_id,
+             cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
+             pages_fts.rank as score,
+             0 as stale
+           FROM pages_fts
+           JOIN pages p ON p.id = pages_fts.rowid
+           LEFT JOIN content_chunks cc ON cc.page_id = p.id AND cc.chunk_index = 0
+           WHERE pages_fts MATCH ?${typeFilter}
+           ORDER BY pages_fts.rank
+           LIMIT ? OFFSET ?`
+        ).all(...pageParams) as Record<string, unknown>[];
+        for (const r of pageRows) {
+          if (!seenSlugs.has(r.slug as string)) {
+            seenSlugs.add(r.slug as string);
+            rows.push(r);
+          }
+        }
+      } catch { /* pages_fts may not match — ignore */ }
+    }
+
     return rows.map(r => this._rowToSearchResult(r));
   }
 
