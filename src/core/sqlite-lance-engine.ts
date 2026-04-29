@@ -1061,6 +1061,17 @@ export class SQLiteLanceEngine implements BrainEngine {
     return chunks;
   }
 
+  async compact(): Promise<{ compacted: boolean; stats?: unknown }> {
+    try {
+      const table = await this._ensureLanceTable();
+      const stats = await table.optimize({ cleanupOlderThan: new Date() });
+      return { compacted: true, stats };
+    } catch (e: any) {
+      console.warn('LanceDB compaction failed:', e.message);
+      return { compacted: false, stats: e.message };
+    }
+  }
+
   async executeRaw<T = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<T[]> {
     const t = sql.trim().toUpperCase();
     if (t.startsWith('SELECT') || t.startsWith('WITH') || t.startsWith('PRAGMA'))
