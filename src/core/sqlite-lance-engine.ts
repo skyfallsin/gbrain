@@ -123,6 +123,30 @@ export class SQLiteLanceEngine implements BrainEngine {
     return this._lanceTable;
   }
 
+  /**
+   * Create or rebuild the IVF_PQ vector index on the vectors table.
+   * Without this, every vectorSearch() is a brute-force flat scan that loads
+   * ALL vectors into memory. With the index, LanceDB caches a compressed
+   * representation and only touches the relevant partitions.
+   *
+   * Safe to call multiple times — rebuilds the index if it already exists.
+   * Requires at least 256 rows to build a meaningful index; skips silently below that.
+   */
+  async ensureVectorIndex(): Promise<{ indexed: boolean; rowCount: number }> {
+    try {
+      const table = await this._ensureLanceTable();
+      const rowCount = await table.countRows();
+      if (rowCount < 256) {
+        return { indexed: false, rowCount };
+      }
+      await table.createIndex('vector');
+      return { indexed: true, rowCount };
+    } catch (e: any) {
+      console.warn('LanceDB vector index creation failed:', e.message);
+      return { indexed: false, rowCount: 0 };
+    }
+  }
+
   async transaction<T>(fn: (engine: BrainEngine) => Promise<T>): Promise<T> {
     if (this._inTransaction) return fn(this);
     this.db.exec('BEGIN');
@@ -1065,7 +1089,9 @@ export class SQLiteLanceEngine implements BrainEngine {
     try {
       const table = await this._ensureLanceTable();
       const stats = await table.optimize({ cleanupOlderThan: new Date() });
-      return { compacted: true, stats };
+      // Rebuild vector index after compaction so searches use the optimized data
+      const indexResult = await this.ensureVectorIndex();
+      return { compacted: true, stats: { optimize: stats, index: indexResult } };
     } catch (e: any) {
       console.warn('LanceDB compaction failed:', e.message);
       return { compacted: false, stats: e.message };
