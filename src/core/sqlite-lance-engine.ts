@@ -452,7 +452,7 @@ export class SQLiteLanceEngine implements BrainEngine {
          chunk_source = excluded.chunk_source,
          model = COALESCE(excluded.model, content_chunks.model),
          token_count = excluded.token_count,
-         embedded_at = COALESCE(excluded.embedded_at, content_chunks.embedded_at),
+         embedded_at = CASE WHEN excluded.chunk_text != content_chunks.chunk_text AND excluded.embedded_at IS NULL THEN NULL ELSE COALESCE(excluded.embedded_at, content_chunks.embedded_at) END,
          language = excluded.language,
          symbol_name = excluded.symbol_name,
          symbol_type = excluded.symbol_type,
@@ -465,6 +465,7 @@ export class SQLiteLanceEngine implements BrainEngine {
     );
 
     const vectorsToAdd: Array<{ chunk_id: number; vector: number[]; slug: string; page_id: number; chunk_index: number; chunk_text: string; chunk_source: string }> = [];
+    const staleVectorIds: number[] = [];
 
     for (const chunk of chunks) {
       const now = chunk.embedding ? new Date().toISOString() : null;
@@ -485,6 +486,8 @@ export class SQLiteLanceEngine implements BrainEngine {
           slug, page_id: pageId, chunk_index: chunk.chunk_index,
           chunk_text: chunk.chunk_text, chunk_source: chunk.chunk_source,
         });
+      } else {
+        staleVectorIds.push(result.id);
       }
     }
 
@@ -495,6 +498,13 @@ export class SQLiteLanceEngine implements BrainEngine {
         try { await table.delete(`chunk_id IN (${cids.join(',')})`); } catch {}
         await table.add(vectorsToAdd);
       } catch (err) { console.warn('[sqlite-lance] LanceDB vector upsert failed:', err); }
+    }
+
+    if (staleVectorIds.length > 0) {
+      try {
+        const table = await this._ensureLanceTable();
+        await table.delete(`chunk_id IN (${staleVectorIds.join(',')})`);
+      } catch {}
     }
   }
 

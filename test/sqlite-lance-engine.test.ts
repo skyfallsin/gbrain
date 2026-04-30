@@ -476,6 +476,42 @@ describe('SQLiteLanceEngine: Chunks', () => {
     const chunks = await engine.getChunks('test/order');
     expect(chunks.map(c => c.chunk_text)).toEqual(['First', 'Second', 'Third']);
   });
+
+  test('changed chunk_text nulls embedded_at so listStaleChunks picks it up', async () => {
+    await engine.putPage('test/stale-embed', testPage);
+
+    // 1. Upsert with a fake embedding so embedded_at is set
+    const fakeVec = new Float32Array(768).fill(0.1);
+    await engine.upsertChunks('test/stale-embed', [
+      { chunk_index: 0, chunk_text: 'Original text', chunk_source: 'compiled_truth', embedding: fakeVec },
+      { chunk_index: 1, chunk_text: 'Unchanged text', chunk_source: 'compiled_truth', embedding: fakeVec },
+    ]);
+
+    // Verify both are embedded (not stale)
+    const chunksV1 = await engine.getChunks('test/stale-embed');
+    expect(chunksV1[0].embedded_at).not.toBeNull();
+    expect(chunksV1[1].embedded_at).not.toBeNull();
+    expect(await engine.countStaleChunks()).toBe(0);
+
+    // 2. Re-upsert: chunk 0 has changed text but no embedding, chunk 1 unchanged
+    await engine.upsertChunks('test/stale-embed', [
+      { chunk_index: 0, chunk_text: 'Updated text', chunk_source: 'compiled_truth' },
+      { chunk_index: 1, chunk_text: 'Unchanged text', chunk_source: 'compiled_truth' },
+    ]);
+
+    // 3. Verify: changed chunk has embedded_at = NULL, unchanged keeps its timestamp
+    const chunksV2 = await engine.getChunks('test/stale-embed');
+    expect(chunksV2[0].chunk_text).toBe('Updated text');
+    expect(chunksV2[0].embedded_at).toBeNull();
+    expect(chunksV2[1].chunk_text).toBe('Unchanged text');
+    expect(chunksV2[1].embedded_at).not.toBeNull();
+
+    // 4. listStaleChunks should include the changed chunk
+    const stale = await engine.listStaleChunks();
+    const staleTexts = stale.map(s => s.chunk_text);
+    expect(staleTexts).toContain('Updated text');
+    expect(staleTexts).not.toContain('Unchanged text');
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────
